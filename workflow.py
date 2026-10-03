@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import calendar
 import hashlib
+import hmac
 import io
 import json
 import math
@@ -10,7 +12,9 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
@@ -20,10 +24,8 @@ ICONS = ROOT / "icons"
 DATA = ROOT / "data"
 INDEX = DATA / "index.json"
 STATE = DATA / "state.json"
-# sources/<login>.json -> numeric GitHub user id of the account that owns the file.
-# Logins can be renamed and then re-registered by someone else; the id never changes.
 OWNERS = DATA / "owners.json"
-LEGACY_INDEX = ROOT / "index.json"  # older layout, migrated on the next build
+LEGACY_INDEX = ROOT / "index.json"
 LEGACY_STATE = ROOT / "state.json"
 
 API = "https://api.github.com"
@@ -32,13 +34,17 @@ CATALOG_OWNER = os.environ.get("GITHUB_REPOSITORY_OWNER", "").lower()
 CATALOG_REPO = os.environ.get("GITHUB_REPOSITORY", "")
 BRANCH = os.environ.get("CATALOG_BRANCH", "main")
 
-# A repository that cannot be found is removed after this many consecutive checks.
-COUNTDOWN_START = 3
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "").strip()
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
+R2_BUCKET = os.environ.get("R2_BUCKET", "").strip()
+R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "").strip().rstrip("/")
+R2_PREFIX = "packs"
+R2_PRUNE_DAYS = int(os.environ.get("R2_PRUNE_DAYS", "").strip() or 7)
 
 MAX_ZIPS_PER_RELEASE = 10
 MAX_PARTS = MAX_ZIPS_PER_RELEASE
 MAX_REPOS_PER_SOURCE = 100
-# These limits mirror the mod (BundleLimits.DEFAULT); keep them in sync.
 MAX_ZIP_BYTES = 100 * 1024 * 1024
 MAX_EXPANDED_BYTES = 250 * 1024 * 1024
 MAX_JSON_BYTES = 4 * 1024 * 1024
@@ -126,6 +132,133 @@ def download(url, limit):
     return data
 
 
+def r2_configured():
+    return all((R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_PUBLIC_URL))
+
+
+def _hmac(key, message):
+    return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
+
+
+def r2_request(method, key="", query=None, body=b"", headers=None):
+    host = f"{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+    path = "/" + R2_BUCKET + ("/" + urllib.parse.quote(key, safe="/-_.~") if key else "")
+    canonical_query = "&".join(
+        f"{urllib.parse.quote(k, safe='-_.~')}={urllib.parse.quote(str(v), safe='-_.~')}"
+        for k, v in sorted((query or {}).items()))
+    url = f"https://{host}{path}" + (f"?{canonical_query}" if canonical_query else "")
+    payload_hash = hashlib.sha256(body).hexdigest()
+    last = None
+    for attempt in range(3):
+        amz_date = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        day = amz_date[:8]
+        signed_headers = {k.lower(): str(v).strip() for k, v in (headers or {}).items()}
+        signed_headers.update({"host": host, "x-amz-date": amz_date, "x-amz-content-sha256": payload_hash})
+        names = sorted(signed_headers)
+        canonical = "\n".join([
+            method, path, canonical_query,
+            "".join(f"{n}:{signed_headers[n]}\n" for n in names),
+            ";".join(names), payload_hash,
+        ])
+        scope = f"{day}/auto/s3/aws4_request"
+        string_to_sign = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope,
+                                    hashlib.sha256(canonical.encode("utf-8")).hexdigest()])
+        signing_key = ("AWS4" + R2_SECRET_ACCESS_KEY).encode("utf-8")
+        for part in (day, "auto", "s3", "aws4_request"):
+            signing_key = _hmac(signing_key, part)
+        signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+        sent = {n: v for n, v in signed_headers.items() if n != "host"}
+        sent["authorization"] = (f"AWS4-HMAC-SHA256 Credential={R2_ACCESS_KEY_ID}/{scope}, "
+                                 f"SignedHeaders={';'.join(names)}, Signature={signature}")
+        request = urllib.request.Request(url, data=body if method in ("PUT", "POST") else None,
+                                         method=method, headers=sent)
+        try:
+            with urllib.request.urlopen(request, timeout=300) as response:
+                return response.status, dict(response.headers), response.read()
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return 404, {}, b""
+            if error.code in (429,) or error.code >= 500:
+                last = error
+                time.sleep(5 * (attempt + 1))
+                continue
+            detail = error.read()[:300].decode("utf-8", "replace")
+            raise RuntimeError(f"R2 {method} {key or R2_BUCKET}: HTTP {error.code} {detail}")
+        except (urllib.error.URLError, TimeoutError) as error:
+            last = error
+            time.sleep(5 * (attempt + 1))
+    raise RuntimeError(f"R2 unavailable for {method} {key or R2_BUCKET}: {last}")
+
+
+def r2_key(listed, sha256):
+    return f"{R2_PREFIX}/{listed.lower()}/{sha256}.zip"
+
+
+def r2_url(key):
+    return f"{R2_PUBLIC_URL}/{key}"
+
+
+def key_of_url(url):
+    prefix = R2_PUBLIC_URL + "/"
+    return url[len(prefix):] if isinstance(url, str) and url.startswith(prefix) else None
+
+
+def publish_zip(listed, data, sha256, file_name):
+    key = r2_key(listed, sha256)
+    status, headers, _ = r2_request("HEAD", key)
+    stored = {k.lower(): v for k, v in headers.items()}.get("x-amz-meta-sha256")
+    if status != 200 or stored != sha256:
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", file_name) or "bundle.zip"
+        r2_request("PUT", key, body=data, headers={
+            "Content-Type": "application/zip",
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "x-amz-meta-sha256": sha256,
+        })
+    return r2_url(key)
+
+
+def r2_list(prefix):
+    ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+    token = None
+    while True:
+        query = {"list-type": "2", "prefix": prefix}
+        if token:
+            query["continuation-token"] = token
+        _, _, body = r2_request("GET", query=query)
+        root = ET.fromstring(body)
+        for item in root.findall("s3:Contents", ns):
+            key = item.findtext("s3:Key", default="", namespaces=ns)
+            modified = item.findtext("s3:LastModified", default="", namespaces=ns)
+            try:
+                stamp = calendar.timegm(time.strptime(modified[:19], "%Y-%m-%dT%H:%M:%S"))
+            except ValueError:
+                stamp = time.time()
+            yield key, stamp
+        if root.findtext("s3:IsTruncated", default="false", namespaces=ns) != "true":
+            return
+        token = root.findtext("s3:NextContinuationToken", namespaces=ns)
+        if not token:
+            return
+
+
+def prune_r2(referenced, listed):
+    cutoff = time.time() - R2_PRUNE_DAYS * 86400 if R2_PRUNE_DAYS > 0 else None
+    removed_repos, removed_old = set(), 0
+    for key, modified in list(r2_list(R2_PREFIX + "/")):
+        parts = key.split("/")
+        if len(parts) != 4 or not key.endswith(".zip") or key in referenced:
+            continue
+        repo = f"{parts[1]}/{parts[2]}"
+        if repo not in listed:
+            r2_request("DELETE", key)
+            removed_repos.add(repo)
+        elif cutoff is not None and modified < cutoff:
+            r2_request("DELETE", key)
+            removed_old += 1
+    return sorted(removed_repos), removed_old
+
+
 def _reject_constant(value):
     raise ValueError(value)
 
@@ -146,7 +279,6 @@ def is_int(value):
 
 
 def as_float(value):
-    """Mirrors Gson getAsFloat: a number or a numeric string, and finite."""
     if is_num(value):
         number = float(value)
     elif isinstance(value, str) and NUMERIC.match(value):
@@ -245,7 +377,6 @@ def check_asset(namespace, asset_namespace, entry, names, where, deferred=None):
         raise Invalid(f"{where}: cross-bundle asset reference is not allowed ({asset_namespace})")
     if entry is not None and entry not in names:
         if deferred is not None:
-            # A part of a collection may use files of the other parts; checked once all parts are known.
             deferred.append((entry, where))
         else:
             raise Invalid(f"{where}: referenced asset is missing: {entry}")
@@ -419,7 +550,6 @@ def validate_zip(data):
 
 
 def read_source(path):
-    """A source file is named after its author's GitHub login and lists their repositories."""
     if not SOURCE_NAME.match(path.name):
         raise Invalid("file name must be your lowercase GitHub username followed by .json")
     try:
@@ -479,7 +609,6 @@ def org_has_public_member(org, user):
 
 
 def check_submitter(meta, author):
-    """The person opening the pull request must own the repository they submit."""
     if not author:
         return
     author = author.lower()
@@ -493,7 +622,7 @@ def check_submitter(meta, author):
         "repository can add it (for an organization, make your membership public in the organization's People page)")
 
 
-def build_entry(stem, listed, meta, release, asset):
+def build_entry(stem, listed, meta, release, asset, publish=False):
     if asset["size"] > MAX_ZIP_BYTES:
         raise Invalid(f"{asset['name']}: larger than {MAX_ZIP_BYTES // (1024 * 1024)} MB")
     data = download(asset["browser_download_url"], MAX_ZIP_BYTES)
@@ -530,6 +659,8 @@ def build_entry(stem, listed, meta, release, asset):
         "sha256": hashlib.sha256(data).hexdigest(),
         "icon_url": None,
     }
+    if publish:
+        entry["download_url"] = publish_zip(listed, data, entry["sha256"], asset["name"])
     if "collection" in bundle:
         entry["collection"] = dict(bundle["collection"])
         entry["key"] += f".p{bundle['collection']['order']}"
@@ -537,7 +668,6 @@ def build_entry(stem, listed, meta, release, asset):
 
 
 def check_collection(parts):
-    """All parts of one bundle (same namespace and id) published in one release."""
     total = parts[0][0]["collection"]["total"]
     orders = sorted(e["collection"]["order"] for e, _, _ in parts)
     name = f"{parts[0][0]['namespace']}:{parts[0][0]['id']}"
@@ -572,8 +702,8 @@ def check_collection(parts):
                 raise Invalid(f"{where}: referenced asset is missing in every part: {asset}")
 
 
-def build_entries(stem, listed, meta, release, assets):
-    built = [build_entry(stem, listed, meta, release, asset) for asset in assets]
+def build_entries(stem, listed, meta, release, assets, publish=False):
+    built = [build_entry(stem, listed, meta, release, asset, publish) for asset in assets]
     groups = {}
     for item in built:
         groups.setdefault((item[0]["namespace"], item[0]["id"]), []).append(item)
@@ -583,7 +713,6 @@ def build_entries(stem, listed, meta, release, assets):
                           "(parts of one bundle need bundle.collection)")
         if "collection" in parts[0][0]:
             check_collection(parts)
-    # A bundle in several parts has one icon: the one of part 1.
     return [(e, None if "collection" in e and e["collection"]["order"] != 1 else icon) for e, icon, _ in built]
 
 
@@ -593,14 +722,13 @@ def clash_with(entry, others):
         if other["key"] == entry["key"]:
             continue
         if other.get("repo", "").lower() == entry["repo"].lower():
-            continue  # the same repository listed under an older owner/name
+            continue
         if (other["namespace"], other["id"]) == (entry["namespace"], entry["id"]):
             if "collection" in entry and "collection" in other and other["source_repo"] == entry["source_repo"]:
-                continue  # parts of the same bundle
+                continue
             return other
         if other["namespace"] == entry["namespace"] and other["repo"].split("/")[0].lower() != owner:
             return other
-        # The mod registers emotes as namespace:emote_id, so two bundles of one namespace must not share one.
         if other["namespace"] == entry["namespace"] and set(other.get("emote_ids", [])) & set(entry.get("emote_ids", [])):
             return other
     return None
@@ -614,7 +742,6 @@ def load_json(path, fallback):
 
 
 def icon_dir(listed):
-    """icons/<repository owner>/<repository>/ (a repository is listed once in the whole catalog)."""
     owner, name = listed.lower().split("/")
     return ICONS / owner / name
 
@@ -628,7 +755,6 @@ def remove_icons(listed):
 
 
 def prune_icons(live):
-    """Delete icon folders of repositories that are no longer listed (and leftovers of older layouts)."""
     if not ICONS.is_dir():
         return
     for stray in ICONS.glob("*.png"):
@@ -647,7 +773,6 @@ def prune_icons(live):
 
 
 def load_catalog_files():
-    """Read data/ files, falling back to the older root-level files."""
     state = load_json(STATE, None)
     if state is None:
         state = load_json(LEGACY_STATE, {})
@@ -665,7 +790,6 @@ def load_owners():
 
 
 def record_owners(owners):
-    """Remember the account id behind every source file the first time it is seen."""
     stems = {p.stem for p in SOURCES.glob("*.json")}
     for stem in sorted(stems - set(owners)):
         try:
@@ -680,26 +804,19 @@ def record_owners(owners):
     OWNERS.write_text(json.dumps(owners, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def drop_repos(path, dropped):
-    """Remove repositories from an author's file; delete the file when nothing is left."""
-    data = load_json(path, {})
-    kept = [r for r in data.get("repos", []) if r.lower() not in dropped]
-    if kept:
-        path.write_text(json.dumps({"repos": kept}, indent=2) + "\n", encoding="utf-8")
-    else:
-        path.unlink()
-
-
 def cmd_build():
+    if not r2_configured():
+        sys.exit("R2 is not configured: set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, "
+                 "R2_BUCKET and R2_PUBLIC_URL")
     state, old_bundles = load_catalog_files()
     for pinned in state.values():
-        if "missing" in pinned:  # older state files counted up instead of down
-            pinned["countdown"] = COUNTDOWN_START - pinned.pop("missing")
+        pinned.pop("missing", None)
+        pinned.pop("countdown", None)
     previous = {}
     for old_entry in old_bundles:
         previous.setdefault(old_entry.get("source_repo"), []).append(old_entry)
     entries, problems = [], []
-    live, listed_keys, dropped = set(), set(), {}
+    live, listed_keys = set(), set()
     ICONS.mkdir(exist_ok=True)
     DATA.mkdir(exist_ok=True)
 
@@ -729,15 +846,15 @@ def cmd_build():
                 meta, release, assets = resolve(listed, pinned)
                 if pinned is None:
                     pinned = state[key] = {"repo_id": meta["id"], "owner_id": meta["owner"]["id"]}
-                pinned["countdown"] = COUNTDOWN_START
                 cache_key = "|".join(f"{a['id']}:{a['updated_at']}:{a['size']}" for a in assets)
                 if (key in previous and pinned.get("release") == cache_key
                         and all(e.get("icon_url") is None or e["icon_url"].endswith("/" + icon_path(key, e))
-                                for e in previous[key])):
+                                for e in previous[key])
+                        and all(key_of_url(e.get("download_url")) for e in previous[key])):
                     current = [dict(e, repo=meta["full_name"], repo_url=meta["html_url"], source=stem)
                                for e in previous[key]]
                 else:
-                    built = build_entries(stem, key, meta, release, assets)
+                    built = build_entries(stem, key, meta, release, assets, publish=True)
                     remove_icons(key)
                     current = []
                     for entry, icon in built:
@@ -757,17 +874,9 @@ def cmd_build():
                             e["icon_url"] = icons.get((e["namespace"], e["id"]))
                 entries.extend(current)
             except Gone as error:
-                pinned = state.setdefault(key, {"repo_id": None, "owner_id": None, "countdown": COUNTDOWN_START})
-                pinned["countdown"] = pinned.get("countdown", COUNTDOWN_START) - 1
-                problems.append(f"{label}: gone ({error}), removal countdown: {max(pinned['countdown'], 0)} left")
-                if pinned["countdown"] <= 0 or pinned["repo_id"] is None:
-                    dropped.setdefault(path, set()).add(key)
-                    state.pop(key, None)
-                    listed_keys.discard(key)
-                    live.discard(key)
-                    problems.append(f"{label}: removed from the catalog")
-                else:
-                    entries.extend(previous.get(key, []))
+                problems.append(f"{label}: unavailable on GitHub ({error}); last published version kept, "
+                                "remove it from the source file with a pull request to delete it")
+                entries.extend(previous.get(key, []))
             except Invalid as error:
                 problems.append(f"{label}: latest release rejected ({error})")
                 entries.extend(previous.get(key, []))
@@ -775,11 +884,8 @@ def cmd_build():
                 problems.append(f"{label}: skipped this run ({error})")
                 entries.extend(previous.get(key, []))
 
-    for path, keys in dropped.items():
-        drop_repos(path, keys)
     record_owners(load_owners())
 
-    # The parts of one bundle are accepted or hidden together.
     groups = {}
     for entry in sorted(entries, key=lambda e: (not e["official"], e["source_repo"] not in previous, e["key"])):
         group = (entry["source_repo"], entry["namespace"], entry["id"]) if "collection" in entry else entry["key"]
@@ -798,6 +904,15 @@ def cmd_build():
         if known not in listed_keys:
             state.pop(known)
     prune_icons(live)
+    try:
+        referenced = {key_of_url(e.get("download_url")) for e in entries + accepted} - {None}
+        removed_repos, removed_old = prune_r2(referenced, live)
+        for repo in removed_repos:
+            print(f"{repo}: removed from sources/, its zips were deleted from R2")
+        if removed_old:
+            print(f"{removed_old} zip(s) of older releases deleted from R2")
+    except Exception as error:
+        problems.append(f"R2 cleanup skipped this run ({error})")
 
     if old_bundles != accepted or not INDEX.exists():
         INDEX.write_text(json.dumps({
@@ -815,7 +930,6 @@ def cmd_build():
 
 
 def base_repos(path):
-    """Repositories already listed in the file on the main branch (empty for a new file)."""
     try:
         relative = path.resolve().relative_to(ROOT).as_posix()
         raw = subprocess.run(["git", "show", f"HEAD:{relative}"], cwd=ROOT, check=True,
@@ -826,12 +940,11 @@ def base_repos(path):
 
 
 def ownership_error(stem, owners, author, author_id):
-    """None when the pull request author may add, edit or delete sources/<stem>.json."""
     if not author or author == CATALOG_OWNER:
         return None
     if stem in owners:
         if author_id is not None and owners[stem] == author_id:
-            return None  # also after the owner renamed their GitHub account
+            return None
         return f"sources/{stem}.json belongs to another GitHub account"
     if author == stem:
         return None
@@ -839,7 +952,6 @@ def ownership_error(stem, owners, author, author_id):
 
 
 def listed_after_pr():
-    """repository key -> source files listing it, as the sources/ folder will be after the merge."""
     listing = {}
     for path in SOURCES.glob("*.json"):
         try:
@@ -852,7 +964,6 @@ def listed_after_pr():
 
 
 def cmd_check(files):
-    """Check a pull request. Files that no longer exist in the work tree are deletions."""
     state, existing = load_catalog_files()
     owners = load_owners()
     author = os.environ.get("PR_AUTHOR", "").lower()
@@ -861,7 +972,7 @@ def cmd_check(files):
     failed = False
     listing = listed_after_pr()
     existing = [e for e in existing if e.get("source_repo") in listing]
-    taken = set()  # repositories accepted earlier in this pull request
+    taken = set()
     pending = []
     for file in files:
         path = Path(file)
@@ -881,7 +992,6 @@ def cmd_check(files):
                 others = [s for s in listing.get(repo.lower(), []) if s != path.stem]
                 if others:
                     raise Invalid(f"{repo} is also listed in sources/{others[0]}.json")
-            # Repositories already accepted for this account may move freely between its files.
             owner_id = owners.get(path.stem, author_id)
             own_files = {path.stem} | {s for s, uid in owners.items() if owner_id is not None and uid == owner_id}
             known = set().union(*(base_repos(SOURCES / f"{s}.json") for s in own_files))

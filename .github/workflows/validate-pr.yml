@@ -46,8 +46,6 @@ jobs:
           if problems or not files or len(files) > 25:
               print("::error::A submission may only add, edit, rename or delete files sources/<github-username>.json. Offending: " + ", ".join(problems))
               sys.exit(1)
-          # Recreate sources/ as it will be after the merge; who may touch which file
-          # (by account id, so renamed accounts keep their file) is checked by workflow.py.
           names = []
           for f in files:
               gone = [f["filename"]] if f["status"] == "removed" else []
@@ -74,12 +72,9 @@ jobs:
         run: python ./workflow.py check ${{ steps.files.outputs.list }} 2>&1 | tee result.txt
 
       - name: Merge
-        # Merge exactly the commit that was validated; if the author pushed
-        # something else in the meantime the merge is refused.
         run: gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$PR_HEAD_SHA"
 
       - name: Rebuild the catalog now
-        # Merges made with GITHUB_TOKEN do not trigger the push workflow.
         run: gh workflow run build-index.yml --repo "$REPO"
 
       - name: Explain the failure

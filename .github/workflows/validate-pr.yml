@@ -1,0 +1,95 @@
+name: Validate submission
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: validate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR: ${{ github.event.pull_request.number }}
+      PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+      PR_AUTHOR_ID: ${{ github.event.pull_request.user.id }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Collect the submitted source files
+        id: files
+        run: |
+          gh api "repos/$REPO/pulls/$PR/files" --paginate > files.json
+          python - <<'PY'
+          import json, re, subprocess, sys, os
+          files = json.load(open("files.json"))
+          pattern = re.compile(r"^sources/[a-z0-9][a-z0-9-]{0,38}\.json$")
+          problems = []
+          for f in files:
+              names = [f["filename"]] + ([f.get("previous_filename", "")] if f["status"] == "renamed" else [])
+              if f["status"] not in ("added", "modified", "removed", "renamed") or not all(pattern.match(n) for n in names):
+                  problems.append(" -> ".join(reversed(names)))
+          if problems or not files or len(files) > 25:
+              print("::error::A submission may only add, edit, rename or delete files sources/<github-username>.json. Offending: " + ", ".join(problems))
+              sys.exit(1)
+          # Recreate sources/ as it will be after the merge; who may touch which file
+          # (by account id, so renamed accounts keep their file) is checked by workflow.py.
+          names = []
+          for f in files:
+              gone = [f["filename"]] if f["status"] == "removed" else []
+              if f["status"] == "renamed":
+                  gone = [f["previous_filename"]]
+              for name in gone:
+                  if os.path.exists(name):
+                      os.remove(name)
+                  names.append(name)
+              if f["status"] == "removed":
+                  continue
+              raw = subprocess.run(["gh", "api", "-H", "Accept: application/vnd.github.raw", f["contents_url"]],
+                                   check=True, capture_output=True).stdout
+              if len(raw) > 8192:
+                  print("::error::" + f["filename"] + " is too large"); sys.exit(1)
+              open(f["filename"], "wb").write(raw)
+              names.append(f["filename"])
+          open(os.environ["GITHUB_OUTPUT"], "a").write("list=" + " ".join(dict.fromkeys(names)) + "\n")
+          PY
+
+      - name: Validate
+        if: steps.files.outputs.list != ''
+        shell: bash
+        run: python ./workflow.py check ${{ steps.files.outputs.list }} 2>&1 | tee result.txt
+
+      - name: Merge
+        # Merge exactly the commit that was validated; if the author pushed
+        # something else in the meantime the merge is refused.
+        run: gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$PR_HEAD_SHA"
+
+      - name: Rebuild the catalog now
+        # Merges made with GITHUB_TOKEN do not trigger the push workflow.
+        run: gh workflow run build-index.yml --repo "$REPO"
+
+      - name: Explain the failure
+        if: failure()
+        run: |
+          {
+            echo "This submission could not be accepted automatically:"
+            echo '```'
+            cat result.txt 2>/dev/null || echo "Only files sources/<github-username>.json that belong to your account may be changed."
+            echo '```'
+            echo "Fix the problem and push again; the check re-runs on every push."
+          } > comment.md
+          gh pr comment "$PR" --repo "$REPO" --body-file comment.md

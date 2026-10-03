@@ -27,11 +27,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CATALOG_BRANCH: ${{ github.ref_name }}
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET: ${{ vars.R2_BUCKET }}
-          R2_PUBLIC_URL: ${{ vars.R2_PUBLIC_URL }}
+          R2_ACCOUNTS: ${{ secrets.R2_ACCOUNTS }}
           R2_PRUNE_DAYS: ${{ vars.R2_PRUNE_DAYS }}
         run: python ./workflow.py build
       - name: Commit changes

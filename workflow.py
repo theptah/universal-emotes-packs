@@ -34,12 +34,8 @@ CATALOG_OWNER = os.environ.get("GITHUB_REPOSITORY_OWNER", "").lower()
 CATALOG_REPO = os.environ.get("GITHUB_REPOSITORY", "")
 BRANCH = os.environ.get("CATALOG_BRANCH", "main")
 
-R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "").strip()
-R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
-R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
-R2_BUCKET = os.environ.get("R2_BUCKET", "").strip()
-R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "").strip().rstrip("/")
 R2_PREFIX = "packs"
+R2_DEFAULT_LIMIT_GB = 9.0
 R2_PRUNE_DAYS = int(os.environ.get("R2_PRUNE_DAYS", "").strip() or 7)
 
 MAX_ZIPS_PER_RELEASE = 10
@@ -132,17 +128,63 @@ def download(url, limit):
     return data
 
 
-def r2_configured():
-    return all((R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_PUBLIC_URL))
+class R2Account:
+    def __init__(self, number, raw):
+        where = f"R2_ACCOUNTS[{number}]"
+        if not isinstance(raw, dict):
+            raise ValueError(f"{where} must be an object")
+        values = {}
+        for field in ("account_id", "access_key_id", "secret_access_key", "bucket", "public_url"):
+            value = raw.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{where}.{field} is missing")
+            values[field] = value.strip()
+        limit = raw.get("limit_gb", R2_DEFAULT_LIMIT_GB)
+        if not is_num(limit) or limit <= 0:
+            raise ValueError(f"{where}.limit_gb must be a positive number")
+        self.number = number + 1
+        self.account_id = values["account_id"]
+        self.access_key_id = values["access_key_id"]
+        self.secret_access_key = values["secret_access_key"]
+        self.bucket = values["bucket"]
+        self.public_url = values["public_url"].rstrip("/")
+        self.limit = int(limit * 1024 ** 3)
+        self.objects = None
+        self.used = 0
+
+    def label(self):
+        return f"R2 account {self.number} ({self.bucket})"
+
+
+def load_r2_accounts():
+    raw = os.environ.get("R2_ACCOUNTS", "").strip()
+    if not raw:
+        raise ValueError("R2_ACCOUNTS is not set")
+    try:
+        items = json.loads(raw)
+    except ValueError:
+        raise ValueError("R2_ACCOUNTS is not valid JSON")
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list) or not items:
+        raise ValueError("R2_ACCOUNTS must be a list of accounts")
+    accounts = [R2Account(number, item) for number, item in enumerate(items)]
+    urls = [a.public_url for a in accounts]
+    if len(set(urls)) != len(urls):
+        raise ValueError("every R2 account needs its own public_url")
+    return accounts
+
+
+R2_ACCOUNTS = []
 
 
 def _hmac(key, message):
     return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
 
 
-def r2_request(method, key="", query=None, body=b"", headers=None):
-    host = f"{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-    path = "/" + R2_BUCKET + ("/" + urllib.parse.quote(key, safe="/-_.~") if key else "")
+def r2_request(account, method, key="", query=None, body=b"", headers=None):
+    host = f"{account.account_id}.r2.cloudflarestorage.com"
+    path = "/" + account.bucket + ("/" + urllib.parse.quote(key, safe="/-_.~") if key else "")
     canonical_query = "&".join(
         f"{urllib.parse.quote(k, safe='-_.~')}={urllib.parse.quote(str(v), safe='-_.~')}"
         for k, v in sorted((query or {}).items()))
@@ -163,12 +205,12 @@ def r2_request(method, key="", query=None, body=b"", headers=None):
         scope = f"{day}/auto/s3/aws4_request"
         string_to_sign = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope,
                                     hashlib.sha256(canonical.encode("utf-8")).hexdigest()])
-        signing_key = ("AWS4" + R2_SECRET_ACCESS_KEY).encode("utf-8")
+        signing_key = ("AWS4" + account.secret_access_key).encode("utf-8")
         for part in (day, "auto", "s3", "aws4_request"):
             signing_key = _hmac(signing_key, part)
         signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
         sent = {n: v for n, v in signed_headers.items() if n != "host"}
-        sent["authorization"] = (f"AWS4-HMAC-SHA256 Credential={R2_ACCESS_KEY_ID}/{scope}, "
+        sent["authorization"] = (f"AWS4-HMAC-SHA256 Credential={account.access_key_id}/{scope}, "
                                  f"SignedHeaders={';'.join(names)}, Signature={signature}")
         request = urllib.request.Request(url, data=body if method in ("PUT", "POST") else None,
                                          method=method, headers=sent)
@@ -183,58 +225,34 @@ def r2_request(method, key="", query=None, body=b"", headers=None):
                 time.sleep(5 * (attempt + 1))
                 continue
             detail = error.read()[:300].decode("utf-8", "replace")
-            raise RuntimeError(f"R2 {method} {key or R2_BUCKET}: HTTP {error.code} {detail}")
+            raise RuntimeError(f"{account.label()} {method} {key or account.bucket}: HTTP {error.code} {detail}")
         except (urllib.error.URLError, TimeoutError) as error:
             last = error
             time.sleep(5 * (attempt + 1))
-    raise RuntimeError(f"R2 unavailable for {method} {key or R2_BUCKET}: {last}")
+    raise RuntimeError(f"{account.label()} unavailable for {method} {key or account.bucket}: {last}")
 
 
-def r2_key(listed, sha256):
-    return f"{R2_PREFIX}/{listed.lower()}/{sha256}.zip"
-
-
-def r2_url(key):
-    return f"{R2_PUBLIC_URL}/{key}"
-
-
-def key_of_url(url):
-    prefix = R2_PUBLIC_URL + "/"
-    return url[len(prefix):] if isinstance(url, str) and url.startswith(prefix) else None
-
-
-def publish_zip(listed, data, sha256, file_name):
-    key = r2_key(listed, sha256)
-    status, headers, _ = r2_request("HEAD", key)
-    stored = {k.lower(): v for k, v in headers.items()}.get("x-amz-meta-sha256")
-    if status != 200 or stored != sha256:
-        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", file_name) or "bundle.zip"
-        r2_request("PUT", key, body=data, headers={
-            "Content-Type": "application/zip",
-            "Cache-Control": "public, max-age=31536000, immutable",
-            "Content-Disposition": f'attachment; filename="{safe_name}"',
-            "x-amz-meta-sha256": sha256,
-        })
-    return r2_url(key)
-
-
-def r2_list(prefix):
+def r2_list(account, prefix=""):
     ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
     token = None
     while True:
         query = {"list-type": "2", "prefix": prefix}
         if token:
             query["continuation-token"] = token
-        _, _, body = r2_request("GET", query=query)
+        _, _, body = r2_request(account, "GET", query=query)
         root = ET.fromstring(body)
         for item in root.findall("s3:Contents", ns):
             key = item.findtext("s3:Key", default="", namespaces=ns)
             modified = item.findtext("s3:LastModified", default="", namespaces=ns)
             try:
+                size = int(item.findtext("s3:Size", default="0", namespaces=ns))
+            except ValueError:
+                size = 0
+            try:
                 stamp = calendar.timegm(time.strptime(modified[:19], "%Y-%m-%dT%H:%M:%S"))
             except ValueError:
                 stamp = time.time()
-            yield key, stamp
+            yield key, size, stamp
         if root.findtext("s3:IsTruncated", default="false", namespaces=ns) != "true":
             return
         token = root.findtext("s3:NextContinuationToken", namespaces=ns)
@@ -242,20 +260,72 @@ def r2_list(prefix):
             return
 
 
+def r2_inventory(problems):
+    for account in R2_ACCOUNTS:
+        try:
+            account.objects = {key: (size, stamp) for key, size, stamp in r2_list(account)}
+            account.used = sum(size for size, _ in account.objects.values())
+        except Exception as error:
+            account.objects = None
+            problems.append(f"{account.label()}: could not be listed, not used this run ({error})")
+
+
+def r2_key(listed, sha256):
+    return f"{R2_PREFIX}/{listed.lower()}/{sha256}.zip"
+
+
+def locate_url(url):
+    if not isinstance(url, str):
+        return None
+    for account in R2_ACCOUNTS:
+        prefix = account.public_url + "/"
+        if url.startswith(prefix):
+            return account, url[len(prefix):]
+    return None
+
+
+def publish_zip(listed, data, sha256, file_name):
+    key = r2_key(listed, sha256)
+    for account in R2_ACCOUNTS:
+        if account.objects is not None and account.objects.get(key, (None,))[0] == len(data):
+            return f"{account.public_url}/{key}"
+    target = next((a for a in R2_ACCOUNTS if a.objects is not None and a.used + len(data) <= a.limit), None)
+    if target is None:
+        raise RuntimeError("every R2 account is full or unavailable; add an account or raise limit_gb")
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", file_name) or "bundle.zip"
+    r2_request(target, "PUT", key, body=data, headers={
+        "Content-Type": "application/zip",
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Content-Disposition": f'attachment; filename="{safe_name}"',
+        "x-amz-meta-sha256": sha256,
+    })
+    previous = target.objects.get(key, (0,))[0]
+    target.objects[key] = (len(data), time.time())
+    target.used += len(data) - previous
+    return f"{target.public_url}/{key}"
+
+
 def prune_r2(referenced, listed):
     cutoff = time.time() - R2_PRUNE_DAYS * 86400 if R2_PRUNE_DAYS > 0 else None
     removed_repos, removed_old = set(), 0
-    for key, modified in list(r2_list(R2_PREFIX + "/")):
-        parts = key.split("/")
-        if len(parts) != 4 or not key.endswith(".zip") or key in referenced:
+    for account in R2_ACCOUNTS:
+        if account.objects is None:
             continue
-        repo = f"{parts[1]}/{parts[2]}"
-        if repo not in listed:
-            r2_request("DELETE", key)
-            removed_repos.add(repo)
-        elif cutoff is not None and modified < cutoff:
-            r2_request("DELETE", key)
-            removed_old += 1
+        for key, (size, modified) in list(account.objects.items()):
+            parts = key.split("/")
+            if (len(parts) != 4 or parts[0] != R2_PREFIX or not key.endswith(".zip")
+                    or (account.number, key) in referenced):
+                continue
+            repo = f"{parts[1]}/{parts[2]}"
+            if repo in listed and (cutoff is None or modified >= cutoff):
+                continue
+            r2_request(account, "DELETE", key)
+            account.objects.pop(key)
+            account.used -= size
+            if repo in listed:
+                removed_old += 1
+            else:
+                removed_repos.add(repo)
     return sorted(removed_repos), removed_old
 
 
@@ -805,9 +875,10 @@ def record_owners(owners):
 
 
 def cmd_build():
-    if not r2_configured():
-        sys.exit("R2 is not configured: set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, "
-                 "R2_BUCKET and R2_PUBLIC_URL")
+    try:
+        R2_ACCOUNTS[:] = load_r2_accounts()
+    except ValueError as error:
+        sys.exit(f"R2 is not configured: {error}")
     state, old_bundles = load_catalog_files()
     for pinned in state.values():
         pinned.pop("missing", None)
@@ -816,6 +887,7 @@ def cmd_build():
     for old_entry in old_bundles:
         previous.setdefault(old_entry.get("source_repo"), []).append(old_entry)
     entries, problems = [], []
+    r2_inventory(problems)
     live, listed_keys = set(), set()
     ICONS.mkdir(exist_ok=True)
     DATA.mkdir(exist_ok=True)
@@ -850,7 +922,7 @@ def cmd_build():
                 if (key in previous and pinned.get("release") == cache_key
                         and all(e.get("icon_url") is None or e["icon_url"].endswith("/" + icon_path(key, e))
                                 for e in previous[key])
-                        and all(key_of_url(e.get("download_url")) for e in previous[key])):
+                        and all(locate_url(e.get("download_url")) for e in previous[key])):
                     current = [dict(e, repo=meta["full_name"], repo_url=meta["html_url"], source=stem)
                                for e in previous[key]]
                 else:
@@ -905,7 +977,8 @@ def cmd_build():
             state.pop(known)
     prune_icons(live)
     try:
-        referenced = {key_of_url(e.get("download_url")) for e in entries + accepted} - {None}
+        referenced = {(found[0].number, found[1]) for found in
+                      (locate_url(e.get("download_url")) for e in entries + accepted) if found}
         removed_repos, removed_old = prune_r2(referenced, live)
         for repo in removed_repos:
             print(f"{repo}: removed from sources/, its zips were deleted from R2")
@@ -925,6 +998,9 @@ def cmd_build():
         legacy.unlink(missing_ok=True)
 
     print(f"{len(accepted)} bundle(s) in the catalog")
+    for account in R2_ACCOUNTS:
+        if account.objects is not None:
+            print(f"{account.label()}: {account.used / 1024 ** 3:.2f} / {account.limit / 1024 ** 3:.2f} GB used")
     for problem in problems:
         print("::warning::" + problem)
 

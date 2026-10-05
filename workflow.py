@@ -24,6 +24,7 @@ ICONS = ROOT / "icons"
 DATA = ROOT / "data"
 INDEX = DATA / "index.json"
 STATE = DATA / "state.json"
+BADGE = DATA / "badge.json"
 OWNERS = DATA / "owners.json"
 LEGACY_INDEX = ROOT / "index.json"
 LEGACY_STATE = ROOT / "state.json"
@@ -994,6 +995,13 @@ def cmd_build():
             "bundles": accepted,
         }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     STATE.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    total_emotes = sum(e.get("emotes", 0) for e in accepted)
+    BADGE.write_text(json.dumps({
+        "schemaVersion": 1,
+        "label": "emotes",
+        "message": f"{total_emotes:,}",
+        "color": "blueviolet",
+    }, indent=2) + "\n", encoding="utf-8")
     for legacy in (LEGACY_INDEX, LEGACY_STATE):
         legacy.unlink(missing_ok=True)
 

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "label": "Current Emote Count",
+  "label": "Live Emote Count",
   "labelColor": "#2c2e33",
   "message": "337",
   "color": "#555555",

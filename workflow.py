@@ -998,7 +998,7 @@ def cmd_build():
     total_emotes = sum(e.get("emotes", 0) for e in accepted)
     BADGE.write_text(json.dumps({
         "schemaVersion": 1,
-        "label": "Current Emote Count",
+        "label": "Live Emote Count",
         "labelColor": "#2c2e33",
         "message": f"{total_emotes:,}",
         "color": "#555555",

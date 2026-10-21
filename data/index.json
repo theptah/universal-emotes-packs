@@ -420,34 +420,6 @@
       "size": 882058,
       "sha256": "91624621856070af5612a9175960dfc896015db3ee018d1639ac760282b4e368",
       "icon_url": "https://raw.githubusercontent.com/theptah/universal-emotes-packs/main/icons/theptah/universal-emotes-officials/universal_emotes.official_r6_pack.png"
-    },
-    {
-      "key": "theptah/universal-emotes-officials/universal_emotes.official_r6_pack",
-      "source": "theptah",
-      "source_repo": "theptah/universal-emotes-officials",
-      "repo": "theptah/universal-emotes-officials",
-      "repo_url": "https://github.com/theptah/universal-emotes-officials",
-      "official": true,
-      "namespace": "universal_emotes",
-      "id": "official_r6_pack",
-      "title": "Universal Emotes Official R6 Pack",
-      "author": "ptah",
-      "description": "",
-      "rig_type": "r6",
-      "version": "1.0.0",
-      "schema_version": 1,
-      "min_mod_version": "1.0.0",
-      "emotes": 1,
-      "emote_ids": [
-        "5x30"
-      ],
-      "release_tag": "v1.0.0",
-      "published_at": "2026-10-07T19:36:51Z",
-      "file_name": "r6_emotes.zip",
-      "download_url": "https://pub-f3bd1500358b4b92b9331204477efdf1.r2.dev/packs/theptah/universal-emotes-officials/91624621856070af5612a9175960dfc896015db3ee018d1639ac760282b4e368.zip",
-      "size": 882058,
-      "sha256": "91624621856070af5612a9175960dfc896015db3ee018d1639ac760282b4e368",
-      "icon_url": "https://raw.githubusercontent.com/theptah/universal-emotes-packs/main/icons/theptah/universal-emotes-officials/universal_emotes.official_r6_pack.png"
     }
   ]
 }

@@ -17,7 +17,7 @@
       "rig_type": "r15",
       "version": "1.0.0",
       "schema_version": 1,
-      "min_mod_version": "1.0.0",
+      "min_mod_version": "1.0.0-beta.1",
       "emotes": 256,
       "emote_ids": [
         "a_bar_song",

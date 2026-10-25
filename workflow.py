@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -37,7 +38,6 @@ BRANCH = os.environ.get("CATALOG_BRANCH", "main")
 
 R2_PREFIX = "packs"
 R2_DEFAULT_LIMIT_GB = 9.0
-R2_PRUNE_DAYS = int(os.environ.get("R2_PRUNE_DAYS", "").strip() or 7)
 
 MAX_ZIPS_PER_RELEASE = 10
 MAX_PARTS = MAX_ZIPS_PER_RELEASE
@@ -306,28 +306,21 @@ def publish_zip(listed, data, sha256, file_name):
     return f"{target.public_url}/{key}"
 
 
-def prune_r2(referenced, listed):
-    cutoff = time.time() - R2_PRUNE_DAYS * 86400 if R2_PRUNE_DAYS > 0 else None
-    removed_repos, removed_old = set(), 0
+def prune_r2(referenced):
+    removed = 0
     for account in R2_ACCOUNTS:
         if account.objects is None:
             continue
-        for key, (size, modified) in list(account.objects.items()):
+        for key, (size, _) in list(account.objects.items()):
             parts = key.split("/")
             if (len(parts) != 4 or parts[0] != R2_PREFIX or not key.endswith(".zip")
                     or (account.number, key) in referenced):
                 continue
-            repo = f"{parts[1]}/{parts[2]}"
-            if repo in listed and (cutoff is None or modified >= cutoff):
-                continue
             r2_request(account, "DELETE", key)
             account.objects.pop(key)
             account.used -= size
-            if repo in listed:
-                removed_old += 1
-            else:
-                removed_repos.add(repo)
-    return sorted(removed_repos), removed_old
+            removed += 1
+    return removed
 
 
 def _reject_constant(value):
@@ -644,7 +637,7 @@ def read_source(path):
     return repos
 
 
-def resolve(repo, pinned):
+def resolve_meta(repo, pinned):
     if pinned:
         meta = api(f"/repositories/{pinned['repo_id']}")
         if meta["owner"]["id"] != pinned["owner_id"]:
@@ -653,21 +646,99 @@ def resolve(repo, pinned):
         meta = api(f"/repos/{repo}")
     if meta.get("private") or meta.get("disabled"):
         raise Gone("repository is private or disabled")
+    return meta
+
+
+def release_assets(release):
+    zips = [a for a in release.get("assets", []) if a["name"].lower().endswith(".zip")
+            and a.get("state") == "uploaded"]
+    if not 1 <= len(zips) <= MAX_ZIPS_PER_RELEASE:
+        raise Invalid(f"release must contain 1 to {MAX_ZIPS_PER_RELEASE} .zip files (found {len(zips)})")
+    return sorted(zips, key=lambda a: a["name"])
+
+
+def resolve(repo, pinned):
+    meta = resolve_meta(repo, pinned)
     try:
         release = api(f"/repositories/{meta['id']}/releases/latest")
     except Gone:
         raise Invalid("repository has no published release")
-    zips = [a for a in release.get("assets", []) if a["name"].lower().endswith(".zip") and a.get("state") == "uploaded"]
-    if not 1 <= len(zips) <= MAX_ZIPS_PER_RELEASE:
-        raise Invalid(f"latest release must contain 1 to {MAX_ZIPS_PER_RELEASE} .zip files (found {len(zips)})")
-    return meta, release, sorted(zips, key=lambda a: a["name"])
+    return meta, release, release_assets(release)
+
+
+def catalog_release(stem, listed, pinned, old):
+    meta = resolve_meta(listed, pinned)
+    base = f"/repositories/{meta['id']}"
+    try:
+        latest = api(base + "/releases/latest")
+    except Gone:
+        return meta, None, None, [], False, "no published release remains", None
+
+    identities = {(e["namespace"], e["id"]) for e in old}
+    previous_release = None
+    if old:
+        release_id = (pinned or {}).get("release_id")
+        if release_id == latest["id"]:
+            previous_release = latest
+        else:
+            tag = old[0].get("release_tag")
+            endpoint = None
+            if release_id is not None:
+                endpoint = base + f"/releases/{release_id}"
+            elif tag:
+                endpoint = base + "/releases/tags/" + urllib.parse.quote(tag, safe="")
+            if endpoint:
+                try:
+                    previous_release = api(endpoint)
+                    if previous_release.get("draft") or previous_release.get("prerelease"):
+                        previous_release = None
+                except Gone:
+                    previous_release = None
+
+    def prepare(release, allowed):
+        assets = release_assets(release)
+        signature = "|".join(f"{a['id']}:{a['updated_at']}:{a['size']}" for a in assets)
+        cached = (bool(old) and (pinned or {}).get("release") == signature
+                  and (pinned or {}).get("release_id") == release["id"]
+                  and (pinned or {}).get("release_updated_at") == release.get("updated_at")
+                  and all(e.get("icon_url") is None or e["icon_url"].endswith("/" + icon_path(listed, e)) for e in old)
+                  and all(locate_url(e.get("download_url")) for e in old))
+        if cached:
+            built = [(dict(e, repo=meta["full_name"], repo_url=meta["html_url"], source=stem), None)
+                     for e in old if allowed is None or (e["namespace"], e["id"]) in allowed]
+        else:
+            built = build_entries(stem, listed, meta, release, assets, publish=True, allowed_bundles=allowed)
+        return signature, built, cached
+
+    def saved_scope(release):
+        if (pinned or {}).get("release_id") == release["id"] and "fallback_bundles" in (pinned or {}):
+            return {tuple(identity) for identity in pinned["fallback_bundles"]}
+        return None
+
+    allowed = saved_scope(latest)
+    if allowed is None and old and previous_release is None:
+        allowed = identities
+    try:
+        signature, built, cached = prepare(latest, allowed)
+        return meta, latest, signature, built, cached, None, allowed
+    except Invalid as error:
+        if previous_release is not None and previous_release["id"] != latest["id"]:
+            try:
+                previous_scope = saved_scope(previous_release)
+                if previous_scope is None:
+                    previous_scope = identities
+                signature, built, cached = prepare(previous_release, previous_scope)
+                return meta, previous_release, signature, built, cached, f"latest release rejected ({error}); valid previous bundles kept", previous_scope
+            except Invalid as previous_error:
+                return meta, None, None, [], False, f"latest and previous releases invalid ({error}; {previous_error})", None
+        return meta, None, None, [], False, f"release rejected ({error}); no valid served release remains", None
 
 
 def org_has_public_member(org, user):
     request = urllib.request.Request(f"{API}/orgs/{org}/public_members/{user}", headers={
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "universal-emotes-catalog",
+        "User-Agent": "universal-emotes-packs",
         **({"Authorization": "Bearer " + TOKEN} if TOKEN else {}),
     })
     try:
@@ -696,11 +767,16 @@ def check_submitter(meta, author):
 def build_entry(stem, listed, meta, release, asset, publish=False):
     if asset["size"] > MAX_ZIP_BYTES:
         raise Invalid(f"{asset['name']}: larger than {MAX_ZIP_BYTES // (1024 * 1024)} MB")
-    data = download(asset["browser_download_url"], MAX_ZIP_BYTES)
+    try:
+        data = download(asset["browser_download_url"], MAX_ZIP_BYTES)
+    except urllib.error.HTTPError as error:
+        if error.code in (404, 410):
+            raise Invalid(f"{asset['name']}: release asset is no longer available (HTTP {error.code})") from error
+        raise
     try:
         pack, emote_ids, icon, names, deferred = validate_zip(data)
-    except Invalid as error:
-        raise Invalid(f"{asset['name']}: {error}")
+    except (Invalid, zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError) as error:
+        raise Invalid(f"{asset['name']}: {error}") from error
     bundle = pack["bundle"]
     description = bundle.get("description", "")
     rig_type = (bundle.get("rig_type") or "r6").strip().lower()
@@ -735,7 +811,7 @@ def build_entry(stem, listed, meta, release, asset, publish=False):
     if "collection" in bundle:
         entry["collection"] = dict(bundle["collection"])
         entry["key"] += f".p{bundle['collection']['order']}"
-    return entry, icon, {"pack": pack, "names": names, "deferred": deferred}
+    return entry, icon, {"pack": pack, "names": names, "deferred": deferred, "data": data}
 
 
 def check_collection(parts):
@@ -773,8 +849,8 @@ def check_collection(parts):
                 raise Invalid(f"{where}: referenced asset is missing in every part: {asset}")
 
 
-def build_entries(stem, listed, meta, release, assets, publish=False):
-    built = [build_entry(stem, listed, meta, release, asset, publish) for asset in assets]
+def build_entries(stem, listed, meta, release, assets, publish=False, allowed_bundles=None):
+    built = [build_entry(stem, listed, meta, release, asset, publish=False) for asset in assets]
     groups = {}
     for item in built:
         groups.setdefault((item[0]["namespace"], item[0]["id"]), []).append(item)
@@ -784,6 +860,11 @@ def build_entries(stem, listed, meta, release, assets, publish=False):
                           "(parts of one bundle need bundle.collection)")
         if "collection" in parts[0][0]:
             check_collection(parts)
+    if allowed_bundles is not None:
+        built = [item for item in built if (item[0]["namespace"], item[0]["id"]) in allowed_bundles]
+    if publish:
+        for entry, _, extra in built:
+            entry["download_url"] = publish_zip(listed, extra["data"], entry["sha256"], entry["file_name"])
     return [(e, None if "collection" in e and e["collection"]["order"] != 1 else icon) for e, icon, _ in built]
 
 
@@ -916,42 +997,47 @@ def cmd_build():
             live.add(key)
             pinned = state.get(key)
             try:
-                meta, release, assets = resolve(listed, pinned)
+                meta, release, cache_key, built, cached, notice, fallback_scope = catalog_release(
+                    stem, key, pinned, previous.get(key, []))
+                if notice:
+                    problems.append(f"{label}: {notice}")
                 if pinned is None:
                     pinned = state[key] = {"repo_id": meta["id"], "owner_id": meta["owner"]["id"]}
-                cache_key = "|".join(f"{a['id']}:{a['updated_at']}:{a['size']}" for a in assets)
-                if (key in previous and pinned.get("release") == cache_key
-                        and all(e.get("icon_url") is None or e["icon_url"].endswith("/" + icon_path(key, e))
-                                for e in previous[key])
-                        and all(locate_url(e.get("download_url")) for e in previous[key])):
-                    current = [dict(e, repo=meta["full_name"], repo_url=meta["html_url"], source=stem)
-                               for e in previous[key]]
-                else:
-                    built = build_entries(stem, key, meta, release, assets, publish=True)
+                current = []
+                if not cached:
                     remove_icons(key)
-                    current = []
-                    for entry, icon in built:
-                        if icon:
-                            folder = icon_dir(key)
-                            folder.mkdir(parents=True, exist_ok=True)
-                            icon_name = f"{entry['namespace']}.{entry['id']}.png"
-                            (folder / icon_name).write_bytes(icon)
-                            if CATALOG_REPO:
-                                entry["icon_url"] = (f"https://raw.githubusercontent.com/{CATALOG_REPO}/"
-                                                     f"{BRANCH}/{icon_path(key, entry)}")
-                        current.append(entry)
+                for entry, icon in built:
+                    if icon:
+                        folder = icon_dir(key)
+                        folder.mkdir(parents=True, exist_ok=True)
+                        icon_name = f"{entry['namespace']}.{entry['id']}.png"
+                        (folder / icon_name).write_bytes(icon)
+                        if CATALOG_REPO:
+                            entry["icon_url"] = (f"https://raw.githubusercontent.com/{CATALOG_REPO}/"
+                                                 f"{BRANCH}/{icon_path(key, entry)}")
+                    current.append(entry)
+                if release is not None:
                     pinned["release"] = cache_key
-                    icons = {(e["namespace"], e["id"]): e["icon_url"] for e in current if e["icon_url"]}
-                    for e in current:
-                        if "collection" in e and not e["icon_url"]:
-                            e["icon_url"] = icons.get((e["namespace"], e["id"]))
+                    pinned["release_id"] = release["id"]
+                    pinned["release_updated_at"] = release.get("updated_at")
+                else:
+                    for field in ("release", "release_id", "release_updated_at"):
+                        pinned.pop(field, None)
+                if fallback_scope is not None and release is not None:
+                    pinned["fallback_bundles"] = [list(identity) for identity in sorted(fallback_scope)]
+                else:
+                    pinned.pop("fallback_bundles", None)
+                icons = {(e["namespace"], e["id"]): e["icon_url"] for e in current if e["icon_url"]}
+                for e in current:
+                    if "collection" in e and not e["icon_url"]:
+                        e["icon_url"] = icons.get((e["namespace"], e["id"]))
                 entries.extend(current)
             except Gone as error:
                 problems.append(f"{label}: unavailable on GitHub ({error}); last published version kept, "
                                 "remove it from the source file with a pull request to delete it")
                 entries.extend(previous.get(key, []))
             except Invalid as error:
-                problems.append(f"{label}: latest release rejected ({error})")
+                problems.append(f"{label}: skipped this run ({error})")
                 entries.extend(previous.get(key, []))
             except Exception as error:
                 problems.append(f"{label}: skipped this run ({error})")
@@ -977,16 +1063,6 @@ def cmd_build():
         if known not in listed_keys:
             state.pop(known)
     prune_icons(live)
-    try:
-        referenced = {(found[0].number, found[1]) for found in
-                      (locate_url(e.get("download_url")) for e in entries + accepted) if found}
-        removed_repos, removed_old = prune_r2(referenced, live)
-        for repo in removed_repos:
-            print(f"{repo}: removed from sources/, its zips were deleted from R2")
-        if removed_old:
-            print(f"{removed_old} zip(s) of older releases deleted from R2")
-    except Exception as error:
-        problems.append(f"R2 cleanup skipped this run ({error})")
 
     if old_bundles != accepted or not INDEX.exists():
         INDEX.write_text(json.dumps({
@@ -1007,6 +1083,15 @@ def cmd_build():
     }, indent=2) + "\n", encoding="utf-8")
     for legacy in (LEGACY_INDEX, LEGACY_STATE):
         legacy.unlink(missing_ok=True)
+
+    try:
+        referenced = {(found[0].number, found[1]) for found in
+                      (locate_url(e.get("download_url")) for e in entries + accepted) if found}
+        removed = prune_r2(referenced)
+        if removed:
+            print(f"{removed} unreferenced zip(s) deleted from R2 (no retention period)")
+    except Exception as error:
+        problems.append(f"R2 cleanup skipped this run ({error})")
 
     print(f"{len(accepted)} bundle(s) in the catalog")
     for account in R2_ACCOUNTS:
